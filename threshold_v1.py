@@ -220,7 +220,7 @@ model = build_transformer_autoencoder(
     num_encoder_blocks=NUM_ENCODER_BLOCKS,
     dropout=DROPOUT)
 
-model.load_weights('./weights/tf_ae.weights.h5')
+model.load_weights('./weights/tf_ae_weights.h5')
 
 print("AE weight loaded")
 
