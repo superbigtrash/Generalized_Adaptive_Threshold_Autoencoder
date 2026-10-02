@@ -77,6 +77,7 @@ def build_transformer_autoencoder(sequence_length=50, n_features=3, d_model=64, 
 
 SEQUENCE_LENGTH = 50
 FUTURE_OFFSET = 100
+TH_LEARNING_RATE = 0.01
 
 N_FEATURES = 3
 D_MODEL = 64
@@ -86,13 +87,13 @@ LATENT_DIM = 32
 NUM_ENCODER_BLOCKS = 2
 DROPOUT = 0.1
 
-THRESHOLD_EPOCHS = 200
+THRESHOLD_EPOCHS = 800
 
 NORMAL_WEIGHT = 1.0
 ANOMALY_WEIGHT = 20.0
 
-SMOOTH_WEIGHT = 100.0
-THRESHOLD_WEIGHT = 3.0
+SMOOTH_WEIGHT = 100
+THRESHOLD_WEIGHT = 4.0
 # =========================================================
 # 데이터
 # =========================================================
@@ -104,9 +105,6 @@ normal_data = normal.copy()
 outlier_data = outlier.copy()
 
 use_col = ['AI0_Vibration', 'AI1_Vibration', 'AI2_Current']
-
-normal_data[use_col] = normal_data[use_col].abs()
-outlier_data[use_col] = outlier_data[use_col].abs()
 
 X_normal = normal_data[use_col]
 y_normal = normal_data['Equipment_state']
@@ -220,7 +218,7 @@ model = build_transformer_autoencoder(
     num_encoder_blocks=NUM_ENCODER_BLOCKS,
     dropout=DROPOUT)
 
-model.load_weights('./weights/tf_ae_weights.h5')
+model.load_weights('./weights/tf_ae.weights.h5')
 
 print("AE weight loaded")
 
@@ -302,7 +300,7 @@ class ThresholdModel(tf.keras.Model):
         return {"loss": total_loss, "classification_loss": classification_loss, "smooth_loss": smooth_loss}
 
 threshold_model = ThresholdModel(base_threshold_model)
-threshold_model.compile(optimizer=Adam(learning_rate=0.001))
+threshold_model.compile(optimizer=Adam(learning_rate=TH_LEARNING_RATE))
 
 threshold_history = threshold_model.fit([valid_latent, valid_error.reshape(-1, 1)], Y_valid.astype(np.float32), epochs=THRESHOLD_EPOCHS, batch_size=len(valid_latent), shuffle=False, callbacks=[EarlyStopping(monitor='loss', patience=15, restore_best_weights=True, verbose=1), ReduceLROnPlateau(monitor='loss', factor=0.5, patience=7, min_lr=1e-6, verbose=1)], verbose=1)
 
