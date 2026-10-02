@@ -73,7 +73,6 @@ def build_transformer_autoencoder(
 
     # Input Embedding (sequence, 3)->(sequence, d_model)
     x = layers.Dense(d_model, name='input_embedding')(inputs)
-
     x = PositionalEncoding(sequence_length=sequence_length, d_model=d_model)(x) # Positional Encoding
 
     for _ in range(num_encoder_blocks): # Transformer Encoder
@@ -132,7 +131,6 @@ y_test_anomaly = y_anomaly
 
 # 8. Scaling 정상 Train 데이터로만 fit
 scaler = MinMaxScaler()
-
 X_train_scaled = scaler.fit_transform(X_train_normal)
 X_test_normal_scaled = scaler.transform(X_test_normal)
 X_test_anomaly_scaled = scaler.transform(X_test_anomaly)
@@ -144,6 +142,11 @@ y_test_anomaly = np.array(y_test_anomaly)
 # 9. Sequence 생성  가이드북 LSTM-AE와 동일
 SEQUENCE_LENGTH = 50
 FUTURE_OFFSET = 100
+TH_LEARNING_RATE = 0.01
+TF_LEARNING_RATE = 0.001
+TF_EPOCHS = 100
+THRESHOLD_EPOCHS = 600
+TF_BATCH_SIZE = 64
 
 N_FEATURES = 3
 D_MODEL = 64
@@ -153,15 +156,11 @@ LATENT_DIM = 32
 NUM_ENCODER_BLOCKS = 2
 DROPOUT = 0.1
 
-THRESHOLD_EPOCHS = 200
-
 NORMAL_WEIGHT = 1.0
 ANOMALY_WEIGHT = 20.0
 
 SMOOTH_WEIGHT = 100.0
-THRESHOLD_WEIGHT = 3.0
-
-SMOOTH_WEIGHT = 100.0
+THRESHOLD_WEIGHT = 4.0
 
 X_train, Y_train = [], []
 for index in range(len(X_train_scaled) - SEQUENCE_LENGTH - FUTURE_OFFSET):
@@ -237,7 +236,7 @@ model = build_transformer_autoencoder(
     dropout=DROPOUT)
 
 # 14. Compile
-model.compile(optimizer=Adam(learning_rate=1e-3),loss='mse')
+model.compile(optimizer=Adam(learning_rate=TF_LEARNING_RATE),loss='mse')
 model.summary()
 
 # 15. Callback
@@ -248,7 +247,7 @@ reduce_lr = ReduceLROnPlateau(monitor='val_loss',factor=0.5,patience=5,min_lr=1e
 # 16. Train  Autoencoder: X_train -> X_train 정상 데이터만 학습
 history = model.fit(X_train,X_train,
                     validation_data=(X_valid_0, X_valid_0),
-                    epochs=100, batch_size=64, shuffle=False,
+                    epochs=TF_EPOCHS, batch_size=TF_BATCH_SIZE, shuffle=False,
                     callbacks=[early_stopping,reduce_lr], verbose=1)
 
 model.save_weights('./weights/tf_ae.weights.h5')
@@ -310,7 +309,6 @@ class ThresholdModel(tf.keras.Model):
         loss_anomaly = -ANOMALY_WEIGHT * y * tf.math.log(y_pred)
         classification_loss = tf.reduce_mean(loss_normal + loss_anomaly)
         smooth_loss = tf.reduce_mean(tf.square(threshold[1:] - threshold[:-1]))
-        classification_loss = tf.reduce_mean(loss_normal + loss_anomaly)
         threshold_loss = tf.reduce_mean(threshold)
         total_loss = classification_loss + SMOOTH_WEIGHT * smooth_loss + THRESHOLD_WEIGHT * threshold_loss
         return total_loss, classification_loss, smooth_loss
@@ -331,7 +329,7 @@ class ThresholdModel(tf.keras.Model):
         return {"loss": total_loss, "classification_loss": classification_loss, "smooth_loss": smooth_loss}
 
 threshold_model = ThresholdModel(base_threshold_model)
-threshold_model.compile(optimizer=Adam(learning_rate=0.001))
+threshold_model.compile(optimizer=Adam(learning_rate=TH_LEARNING_RATE))
 
 threshold_history = threshold_model.fit([valid_latent, valid_error.reshape(-1, 1)], Y_valid.astype(np.float32), epochs=THRESHOLD_EPOCHS, batch_size=len(valid_latent), shuffle=False, callbacks=[EarlyStopping(monitor='loss', patience=15, restore_best_weights=True, verbose=1), ReduceLROnPlateau(monitor='loss', factor=0.5, patience=7, min_lr=1e-6, verbose=1)], verbose=1)
 
