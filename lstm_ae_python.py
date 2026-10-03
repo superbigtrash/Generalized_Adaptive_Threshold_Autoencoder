@@ -8,6 +8,13 @@ from tensorflow.keras import Model, models, layers, optimizers, regularizers
 from sklearn.preprocessing import MinMaxScaler
 from sklearn import metrics
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, classification_report, confusion_matrix
+
+def flatten(X):
+    flattened = np.empty((X.shape[0], X.shape[2]))
+    for i in range(X.shape[0]):
+        flattened[i] = X[i,X.shape[1] - 1,:]
+    return(flattened)
 
 normal = pd.read_csv('./press_data_normal.csv', index_col =0)
 outlier = pd.read_csv('./outlier_data.csv', index_col = 0)
@@ -18,9 +25,6 @@ outlier_data = outlier.copy()
 use_col = ['AI0_Vibration', 'AI1_Vibration', 'AI2_Current']
 
 #=================data preprocessing=======================
-normal_data[use_col] = normal_data[use_col].abs()
-outlier_data[use_col] = outlier_data[use_col].abs()
-
 X_normal = normal_data[use_col]
 y_normal = normal_data['Equipment_state']
 X_anomaly = outlier_data[use_col]
@@ -43,22 +47,34 @@ y_train_normal = np.array(y_train_normal)
 y_test_normal = np.array(y_test_normal)
 y_test_anomaly = np.array(y_test_anomaly)
 #=============================================================
-sequence = 50
+# ================= Hyper parameters def=================
+SEQUENCE = 20
+
+LATENT_DIM = 32
+THRESHOLD_EPOCHS = 1200
+LSTM_EPOCHS = 100
+LSTM_LR = 0.001
+TH_LEARNING_RATE = 0.01
+
+NORMAL_WEIGHT = 1.0
+ANOMALY_WEIGHT = 20.0
+SMOOTH_WEIGHT = 100.0
+THRESHOLD_WEIGHT = 5.0
 #===========================================================
 X_train, Y_train = [], []
-for index in range(len(X_train_scaled) - sequence - 100):
-    X_train.append(X_train_scaled[index: index + sequence])
-    Y_train.append(y_train_normal[index + sequence + 100])
+for index in range(len(X_train_scaled) - SEQUENCE - 100):
+    X_train.append(X_train_scaled[index: index + SEQUENCE])
+    Y_train.append(y_train_normal[index + SEQUENCE + 100])
     
 X_test_normal, Y_test_normal = [], []
-for index in range(len(X_test_normal_scaled) - sequence - 100):
-    X_test_normal.append(X_test_normal_scaled[index:index+sequence])
-    Y_test_normal.append(y_test_normal[index + sequence + 100])
+for index in range(len(X_test_normal_scaled) - SEQUENCE - 100):
+    X_test_normal.append(X_test_normal_scaled[index:index+SEQUENCE])
+    Y_test_normal.append(y_test_normal[index + SEQUENCE + 100])
     
 X_test_anomal, Y_test_anomal = [], []
-for index in range(len(X_test_anomaly_scaled) - sequence - 100):
-    X_test_anomal.append(X_test_anomaly_scaled[index:index+sequence])
-    Y_test_anomal.append(y_test_anomaly[index + sequence + 100])
+for index in range(len(X_test_anomaly_scaled) - SEQUENCE - 100):
+    X_test_anomal.append(X_test_anomaly_scaled[index:index+SEQUENCE])
+    Y_test_anomal.append(y_test_anomaly[index + SEQUENCE + 100])
     
 X_test_normal, Y_test_normal = np.array(X_test_normal), np.array(Y_test_normal)
 X_test_anomal, Y_test_anomal = np.array(X_test_anomal), np.array(Y_test_anomal)
@@ -94,126 +110,174 @@ def LSTM_AE(sequence, n_features):
     lstm_ae.add(layers.TimeDistributed(layers.Dense(n_features)))
     return lstm_ae
 
-lstm_ae = LSTM_AE(sequence, 3)
+lstm_ae = LSTM_AE(SEQUENCE, 3)
 lstm_ae.summary()
 
 reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor = 0.7, patience=50, verbose=1)
 es = EarlyStopping(monitor='val_loss', min_delta=0.00001, patience=120, verbose=1, mode='min',
                    restore_best_weights=True)
 
-lstm_ae.compile(loss='mse', optimizer=optimizers.Adam(0.001))
+lstm_ae.compile(loss='mse', optimizer=optimizers.Adam(LSTM_LR))
 
-history = lstm_ae.fit(X_train, X_train, epochs = 100, batch_size = 128, callbacks = [reduce_lr, es], validation_data = (X_valid_0, X_valid_0))    
+history = lstm_ae.fit(X_train, X_train, epochs = LSTM_EPOCHS, batch_size = 128, callbacks = [reduce_lr, es], validation_data = (X_valid_0, X_valid_0))    
 
-plt.plot(history.history['loss'], label = 'train loss')
-plt.plot(history.history['val_loss'], label = 'valid loss')
-plt.legend()
-plt.xlabel('Epoch')
-plt.ylabel('loss')
-plt.show()
+lstm_ae.save_weights('./weights/seq_50_lstm_ae.weights.h5')
 
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, classification_report, confusion_matrix
+# ================= Latent / Reconstruction Error =================
+latent_input_tensor = layers.Input(shape=(SEQUENCE, 3))
+x = lstm_ae.layers[0](latent_input_tensor)
+latent_output = lstm_ae.layers[1](x)
+latent_model = Model(inputs=latent_input_tensor, outputs=latent_output)
 
-# 정상 validation reconstruction error
-X_valid_pred = lstm_ae.predict(X_valid_0, verbose=0)
-valid_error = np.mean(np.square(X_valid_0 - X_valid_pred), axis=(1, 2))
 
-print("Validation Reconstruction Error")
-print("Mean :", np.mean(valid_error))
-print("Std  :", np.std(valid_error))
-print("Min  :", np.min(valid_error))
-print("Max  :", np.max(valid_error))
+valid_latent = latent_model.predict(X_valid, verbose=0)
+valid_pred = lstm_ae.predict(X_valid, verbose=0)
+valid_error = np.mean(np.power(flatten(X_valid) - flatten(valid_pred), 2), axis=1)
 
-# threshold
-threshold = np.percentile(valid_error, 99)
-print("Threshold :", threshold)
+test_latent = latent_model.predict(X_test, verbose=0)
+test_pred = lstm_ae.predict(X_test, verbose=0)
+test_error = np.mean(np.power(flatten(X_test) - flatten(test_pred), 2), axis=1)
 
-# 정상/이상 test reconstruction error
-normal_pred = lstm_ae.predict(X_test_normal, verbose=0)
-anomaly_pred = lstm_ae.predict(X_test_anomal, verbose=0)
+# ================= Adaptive Threshold =================
+class AdaptiveThreshold(layers.Layer):
+    def __init__(self, hidden_dim=16, **kwargs):
+        super().__init__(**kwargs)
+        self.hidden = layers.Dense(hidden_dim, activation='relu')
+        self.threshold = layers.Dense(1, activation='softplus')
 
-normal_error = np.mean(np.square(X_test_normal - normal_pred), axis=(1, 2))
-anomaly_error = np.mean(np.square(X_test_anomal - anomaly_pred), axis=(1, 2))
+    def build(self, input_shape):
+        self.temperature_raw = self.add_weight(name='temperature_raw', shape=(), initializer=tf.keras.initializers.Constant(-2.0), trainable=True)
+        self.threshold_scale_raw = self.add_weight(name='threshold_scale_raw', shape=(), initializer=tf.keras.initializers.Constant(-1.0), trainable=True)
+        super().build(input_shape)
 
-# Reconstruction Error Distribution
-plt.figure(figsize=(12, 5))
-plt.hist(normal_error, bins=100, alpha=0.6, label='Normal')
-plt.hist(anomaly_error, bins=100, alpha=0.6, label='Anomaly')
-plt.axvline(threshold, linestyle='--', label='Threshold')
-plt.xlabel('Reconstruction Error')
-plt.ylabel('Count')
-plt.title('LSTM-AE Reconstruction Error Distribution')
-plt.legend()
-plt.grid()
-plt.show()
+    def call(self, latent):
+        x = self.hidden(latent)
+        threshold_raw = self.threshold(x)
+        threshold_scale = tf.nn.sigmoid(self.threshold_scale_raw)
+        threshold = threshold_scale * threshold_raw
+        temperature = tf.nn.softplus(self.temperature_raw) + 1e-6
+        return threshold, temperature
 
-# 전체 test reconstruction error
-X_test_pred = lstm_ae.predict(X_test, verbose=0)
-test_error = np.mean(np.square(X_test - X_test_pred), axis=(1, 2))
+latent_input = layers.Input(shape=(LATENT_DIM,), name='latent_input')
+error_input = layers.Input(shape=(1,), name='error_input')
 
-# threshold 기반 이상 판정
-Y_pred = (test_error > threshold).astype(int)
-Y_test_eval = Y_test.astype(int)
+threshold_layer = AdaptiveThreshold(hidden_dim=16, name='adaptive_threshold_layer')
+adaptive_threshold, temperature = threshold_layer(latent_input)
 
-# 평가 지표
+score = layers.Lambda(lambda x: (x[0] - x[1]) / x[2], name='anomaly_score')([error_input, adaptive_threshold, temperature])
+anomaly_probability = layers.Activation('sigmoid', name='anomaly_probability')(score)
+
+base_threshold_model = Model(inputs=[latent_input, error_input], outputs=[anomaly_probability, adaptive_threshold], name='Window_Threshold_Model')
+
+# ================= Custom Threshold Model =================
+class ThresholdModel(tf.keras.Model):
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+
+    def call(self, inputs, training=False):
+        return self.base_model(inputs, training=training)
+
+    def calculate_loss(self, y, y_pred, threshold):
+        y = tf.cast(tf.reshape(y, (-1, 1)), tf.float32)
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+
+        loss_normal = -NORMAL_WEIGHT * (1.0 - y) * tf.math.log(1.0 - y_pred)
+        loss_anomaly = -ANOMALY_WEIGHT * y * tf.math.log(y_pred)
+
+        classification_loss = tf.reduce_mean(loss_normal + loss_anomaly)
+        smooth_loss = tf.reduce_mean(tf.square(threshold[1:] - threshold[:-1]))
+        threshold_loss = tf.reduce_mean(threshold)
+
+        total_loss = classification_loss + SMOOTH_WEIGHT * smooth_loss + THRESHOLD_WEIGHT * threshold_loss
+        return total_loss, classification_loss, smooth_loss, threshold_loss
+
+    def train_step(self, data):
+        x, y = data
+
+        with tf.GradientTape() as tape:
+            y_pred, threshold = self(x, training=True)
+            total_loss, classification_loss, smooth_loss, threshold_loss = self.calculate_loss(y, y_pred, threshold)
+
+        gradients = tape.gradient(total_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+
+        return {
+            "loss": total_loss,
+            "classification_loss": classification_loss,
+            "smooth_loss": smooth_loss,
+            "threshold_loss": threshold_loss
+        }
+
+threshold_model = ThresholdModel(base_threshold_model)
+threshold_model.compile(optimizer=optimizers.Adam(learning_rate=TH_LEARNING_RATE))
+
+threshold_history = threshold_model.fit([valid_latent, valid_error.reshape(-1, 1)], Y_valid.astype(np.float32),
+                                        epochs=THRESHOLD_EPOCHS, batch_size=len(valid_latent), shuffle=False,
+                                        callbacks=[
+                                            EarlyStopping(monitor='loss', patience=15, restore_best_weights=True, verbose=1),
+                                            ReduceLROnPlateau(monitor='loss', factor=0.5, patience=7, min_lr=1e-6, verbose=1)], verbose=1)
+
+# ================= Test Threshold =================
+threshold_output_model = Model(inputs=latent_input, outputs=[adaptive_threshold, temperature])
+
+test_threshold, learned_temperature = threshold_output_model.predict(test_latent, verbose=0)
+test_threshold = test_threshold.reshape(-1)
+
+Y_pred = (test_error > test_threshold).astype(int)
+
+prediction_model = Model(inputs=[latent_input, error_input], outputs=anomaly_probability)
+test_probability = prediction_model.predict([test_latent, test_error.reshape(-1, 1)], verbose=0).reshape(-1)
+
+print("Learned Temperature :", learned_temperature)
+print("Adaptive Threshold Mean :", np.mean(test_threshold))
+print("Adaptive Threshold Std :", np.std(test_threshold))
+print("Adaptive Threshold Min :", np.min(test_threshold))
+print("Adaptive Threshold Max :", np.max(test_threshold))
+
 print("\n==============================")
-print("Evaluation")
+print("LSTM-AE Adaptive Threshold Evaluation")
 print("==============================")
-print("Accuracy :", accuracy_score(Y_test_eval, Y_pred))
-print("Precision :", precision_score(Y_test_eval, Y_pred, zero_division=0))
-print("Recall :", recall_score(Y_test_eval, Y_pred, zero_division=0))
-print("F1 Score :", f1_score(Y_test_eval, Y_pred, zero_division=0))
-print("ROC-AUC :", roc_auc_score(Y_test_eval, test_error))
+print("Accuracy :", accuracy_score(Y_test, Y_pred))
+print("Precision :", precision_score(Y_test, Y_pred, zero_division=0))
+print("Recall :", recall_score(Y_test, Y_pred, zero_division=0))
+print("F1 Score :", f1_score(Y_test, Y_pred, zero_division=0))
+print("ROC-AUC :", roc_auc_score(Y_test, test_probability))
+print(classification_report(Y_test, Y_pred, digits=4, zero_division=0))
 
-print("\nClassification Report")
-print(classification_report(Y_test_eval, Y_pred, digits=4, zero_division=0))
+cm = confusion_matrix(Y_test, Y_pred)
 
-# confusion matrix
-cm = confusion_matrix(Y_test_eval, Y_pred)
-print("\nConfusion Matrix")
-print(cm)
-
-plt.figure(figsize=(6, 5))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
+plt.figure(figsize=(7, 7))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
 plt.xlabel('Predicted')
 plt.ylabel('Actual')
-plt.title('LSTM-AE Confusion Matrix')
+plt.title('LSTM-AE Adaptive Threshold Confusion Matrix')
 plt.show()
 
-# 시간 순 anomaly score
-plt.figure(figsize=(14, 5))
+plt.figure(figsize=(14, 6))
 plt.plot(test_error, label='Reconstruction Error')
-plt.axhline(threshold, linestyle='--', label='Threshold')
+plt.plot(test_threshold, label='Window Threshold')
 plt.xlabel('Sequence Index')
-plt.ylabel('Reconstruction Error')
-plt.title('LSTM-AE Anomaly Score over Time')
+plt.ylabel('Error / Threshold')
+plt.title('LSTM-AE Reconstruction Error vs Adaptive Threshold')
 plt.legend()
 plt.grid()
 plt.show()
 
-# FP / FN
-false_positive_idx = np.where((Y_test_eval == 0) & (Y_pred == 1))[0]
-false_negative_idx = np.where((Y_test_eval == 1) & (Y_pred == 0))[0]
-
-print("False Positive 개수 :", len(false_positive_idx))
-print("False Negative 개수 :", len(false_negative_idx))
-print("False Positive Index :", false_positive_idx)
-print("False Negative Index :", false_negative_idx)
-
-# FP / FN 위치 표시
-plt.figure(figsize=(14, 5))
-plt.plot(test_error, label='Reconstruction Error')
-plt.axhline(threshold, linestyle='--', label='Threshold')
-
-if len(false_positive_idx) > 0:
-    plt.scatter(false_positive_idx, test_error[false_positive_idx], label='False Positive')
-
-if len(false_negative_idx) > 0:
-    plt.scatter(false_negative_idx, test_error[false_negative_idx], label='False Negative')
-
-plt.xlabel('Sequence Index')
-plt.ylabel('Reconstruction Error')
-plt.title('LSTM-AE False Positive / False Negative')
+plt.figure(figsize=(10, 5))
+plt.plot(threshold_history.history['loss'], label='Total Loss')
+plt.plot(threshold_history.history['classification_loss'], label='Classification Loss')
+plt.plot(threshold_history.history['smooth_loss'], label='Smooth Loss')
+plt.plot(threshold_history.history['threshold_loss'], label='Threshold Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Adaptive Threshold Loss')
 plt.legend()
 plt.grid()
 plt.show()
+
+false_positive_idx = np.where((Y_test == 0) & (Y_pred == 1))[0]
+false_negative_idx = np.where((Y_test == 1) & (Y_pred == 0))[0]
+
+print("False Positive :", len(false_positive_idx))
+print("False Negative :", len(false_negative_idx))
