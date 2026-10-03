@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import tensorflow as tf
 import pandas as pd
@@ -161,9 +162,6 @@ outlier_data = outlier.copy()
 
 use_col = ['AI0_Vibration', 'AI1_Vibration', 'AI2_Current']
 
-normal_data[use_col] = normal_data[use_col].abs()
-outlier_data[use_col] = outlier_data[use_col].abs()
-
 X_normal = normal_data[use_col]
 y_normal = normal_data['Equipment_state']
 
@@ -264,6 +262,13 @@ NUM_MAMBA_BLOCKS = 2
 EXPAND = 2
 DROPOUT = 0.1
 
+THRESHOLD_EPOCHS = 600
+TH_LEARNING_RATE = 0.01
+NORMAL_WEIGHT = 1.0
+ANOMALY_WEIGHT = 20.0
+SMOOTH_WEIGHT = 100.0
+THRESHOLD_WEIGHT = 4.0
+
 mamba_ae = build_mamba_autoencoder(
     sequence_length=SEQUENCE_LENGTH,
     n_features=N_FEATURES,
@@ -287,8 +292,11 @@ early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_wei
 # =========================================================
 # 10. Train
 # =========================================================
-history = mamba_ae.fit(X_train, X_train, validation_data=(X_valid_0, X_valid_0),
-    epochs=100, batch_size=64, shuffle=False, callbacks=[reduce_lr, early_stopping],verbose=1)
+history = mamba_ae.fit(X_train, X_train, validation_data=(X_valid_0, X_valid_0), epochs=100, batch_size=64, shuffle=False, callbacks=[reduce_lr, early_stopping], verbose=1)
+
+# Mamba-AE 가중치 저장
+mamba_ae.save_weights('./weights/mamba_ae.weights.h5')
+print("Mamba-AE weights saved.")
 
 # =========================================================
 # 11. Training Loss
@@ -304,115 +312,179 @@ plt.grid()
 plt.show()
 
 # =========================================================
-# 12. Threshold
+# 12. Latent / Reconstruction Error
 # =========================================================
-X_valid_pred = mamba_ae.predict(X_valid_0, verbose=0)
-valid_error = np.mean(np.square(X_valid_0 - X_valid_pred), axis=(1, 2))
+mamba_ae.trainable = False
 
-threshold = np.percentile(valid_error, 99)
+latent_model = Model(inputs=mamba_ae.input, outputs=mamba_ae.get_layer('latent_vector').output)
 
-print("Validation Error Mean :", np.mean(valid_error))
-print("Validation Error Std :", np.std(valid_error))
-print("Threshold :", threshold)
+valid_latent = latent_model.predict(X_valid, verbose=0)
+valid_pred = mamba_ae.predict(X_valid, verbose=0)
+valid_error = np.mean(np.square(X_valid - valid_pred), axis=(1, 2))
+
+test_latent = latent_model.predict(X_test, verbose=0)
+test_pred = mamba_ae.predict(X_test, verbose=0)
+test_error = np.mean(np.square(X_test - test_pred), axis=(1, 2))
 
 # =========================================================
-# 13. Normal / Anomaly Reconstruction Error
+# 13. Adaptive Threshold 설정
 # =========================================================
-normal_pred = mamba_ae.predict(X_test_normal, verbose=0)
-anomaly_pred = mamba_ae.predict(X_test_anomal, verbose=0)
 
-normal_error = np.mean(np.square(X_test_normal - normal_pred), axis=(1, 2))
-anomaly_error = np.mean(np.square(X_test_anomal - anomaly_pred), axis=(1, 2))
+class AdaptiveThreshold(layers.Layer):
+    def __init__(self, hidden_dim=16, **kwargs):
+        super().__init__(**kwargs)
+        self.hidden = layers.Dense(hidden_dim, activation='relu')
+        self.threshold = layers.Dense(1, activation='softplus')
 
-plt.figure(figsize=(12, 5))
-plt.hist(normal_error, bins=100, alpha=0.6, label='Normal')
-plt.hist(anomaly_error, bins=100, alpha=0.6, label='Anomaly')
-plt.axvline(threshold, linestyle='--', label='Threshold')
-plt.xlabel('Reconstruction Error')
-plt.ylabel('Count')
-plt.title('Mamba-AE Reconstruction Error Distribution')
+    def build(self, input_shape):
+        self.temperature_raw = self.add_weight(name='temperature_raw', shape=(), initializer=tf.keras.initializers.Constant(-2.0), trainable=True)
+        self.threshold_scale_raw = self.add_weight(name='threshold_scale_raw', shape=(), initializer=tf.keras.initializers.Constant(-1.0), trainable=True)
+        super().build(input_shape)
+
+    def call(self, latent):
+        x = self.hidden(latent)
+        threshold_raw = self.threshold(x)
+        threshold_scale = tf.nn.sigmoid(self.threshold_scale_raw)
+        threshold = threshold_scale * threshold_raw
+        temperature = tf.nn.softplus(self.temperature_raw) + 1e-6
+        return threshold, temperature
+
+latent_input = layers.Input(shape=(LATENT_DIM,), name='latent_input')
+error_input = layers.Input(shape=(1,), name='error_input')
+
+threshold_layer = AdaptiveThreshold(hidden_dim=16, name='adaptive_threshold_layer')
+adaptive_threshold, temperature = threshold_layer(latent_input)
+
+score = layers.Lambda(lambda x: (x[0] - x[1]) / x[2], name='anomaly_score')([error_input, adaptive_threshold, temperature])
+anomaly_probability = layers.Activation('sigmoid', name='anomaly_probability')(score)
+
+base_threshold_model = Model(inputs=[latent_input, error_input], outputs=[anomaly_probability, adaptive_threshold], name='Mamba_Window_Threshold_Model')
+
+# =========================================================
+# 14. Threshold Custom Model
+# =========================================================
+class ThresholdModel(tf.keras.Model):
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+
+    def call(self, inputs, training=False):
+        return self.base_model(inputs, training=training)
+
+    def calculate_loss(self, y, y_pred, threshold):
+        y = tf.cast(tf.reshape(y, (-1, 1)), tf.float32)
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        loss_normal = -NORMAL_WEIGHT * (1.0 - y) * tf.math.log(1.0 - y_pred)
+        loss_anomaly = -ANOMALY_WEIGHT * y * tf.math.log(y_pred)
+        classification_loss = tf.reduce_mean(loss_normal + loss_anomaly)
+        smooth_loss = tf.reduce_mean(tf.square(threshold[1:] - threshold[:-1]))
+        threshold_loss = tf.reduce_mean(threshold)
+        total_loss = classification_loss + SMOOTH_WEIGHT * smooth_loss + THRESHOLD_WEIGHT * threshold_loss
+        return total_loss, classification_loss, smooth_loss
+
+    def train_step(self, data):
+        x, y = data
+        with tf.GradientTape() as tape:
+            y_pred, threshold = self(x, training=True)
+            total_loss, classification_loss, smooth_loss = self.calculate_loss(y, y_pred, threshold)
+        gradients = tape.gradient(total_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        return {"loss": total_loss, "classification_loss": classification_loss, "smooth_loss": smooth_loss}
+
+    def test_step(self, data):
+        x, y = data
+        y_pred, threshold = self(x, training=False)
+        total_loss, classification_loss, smooth_loss = self.calculate_loss(y, y_pred, threshold)
+        return {"loss": total_loss, "classification_loss": classification_loss, "smooth_loss": smooth_loss}
+
+threshold_model = ThresholdModel(base_threshold_model)
+threshold_model.compile(optimizer=Adam(learning_rate=TH_LEARNING_RATE))
+
+# =========================================================
+# 15. Threshold Train
+# =========================================================
+threshold_history = threshold_model.fit([valid_latent, valid_error.reshape(-1, 1)], Y_valid.astype(np.float32), 
+                                        epochs=THRESHOLD_EPOCHS, batch_size=len(valid_latent), shuffle=False, 
+                                        callbacks=[EarlyStopping(monitor='loss', patience=15, restore_best_weights=True, verbose=1), 
+                                                   ReduceLROnPlateau(monitor='loss', factor=0.5, patience=7, min_lr=1e-6, verbose=1)], 
+                                        verbose=1)
+
+# =========================================================
+# 16. Window Threshold 추출
+# =========================================================
+threshold_output_model = Model(inputs=latent_input, outputs=adaptive_threshold)
+test_threshold = threshold_output_model.predict(test_latent, verbose=0).reshape(-1)
+
+prediction_model = Model(inputs=[latent_input, error_input], outputs=anomaly_probability)
+test_probability = prediction_model.predict([test_latent, test_error.reshape(-1, 1)], verbose=0).reshape(-1)
+
+learned_temperature = float(tf.nn.softplus(threshold_layer.temperature_raw).numpy() + 1e-6)
+Y_pred = (test_error > test_threshold).astype(int)
+Y_test = Y_test.astype(int)
+
+print("Learned Temperature :", learned_temperature)
+print("Adaptive Threshold Mean :", np.mean(test_threshold))
+print("Adaptive Threshold Std :", np.std(test_threshold))
+print("Adaptive Threshold Min :", np.min(test_threshold))
+print("Adaptive Threshold Max :", np.max(test_threshold))
+
+# =========================================================
+# 17. Evaluation
+# =========================================================
+print("\n==============================")
+print("Mamba-AE + Adaptive Threshold")
+print("==============================")
+print("Accuracy :", accuracy_score(Y_test, Y_pred))
+print("Precision :", precision_score(Y_test, Y_pred, zero_division=0))
+print("Recall :", recall_score(Y_test, Y_pred, zero_division=0))
+print("F1 Score :", f1_score(Y_test, Y_pred, zero_division=0))
+print("ROC-AUC :", roc_auc_score(Y_test, test_probability))
+print(classification_report(Y_test, Y_pred, digits=4, zero_division=0))
+
+# =========================================================
+# 18. Confusion Matrix
+# =========================================================
+cm = confusion_matrix(Y_test, Y_pred)
+plt.figure(figsize=(7, 7))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Mamba-AE Adaptive Threshold Confusion Matrix')
+plt.show()
+
+# =========================================================
+# 19. Reconstruction Error / Window Threshold
+# =========================================================
+plt.figure(figsize=(14, 6))
+plt.plot(test_error, label='Reconstruction Error')
+plt.plot(test_threshold, label='Window Threshold')
+plt.xlabel('Sequence Index')
+plt.ylabel('Error / Threshold')
+plt.title('Mamba-AE Reconstruction Error vs Window Threshold')
 plt.legend()
 plt.grid()
 plt.show()
 
 # =========================================================
-# 14. 전체 Test
-# =========================================================
-X_test_pred = mamba_ae.predict(X_test, verbose=0)
-test_error = np.mean(np.square(X_test - X_test_pred), axis=(1, 2))
-
-Y_pred = (test_error > threshold).astype(int)
-Y_test = Y_test.astype(int)
-
-# =========================================================
-# 15. 평가
-# =========================================================
-print("\n==============================")
-print("Mamba-AE Evaluation")
-print("==============================")
-
-print("Accuracy :", accuracy_score(Y_test, Y_pred))
-print("Precision :", precision_score(Y_test, Y_pred, zero_division=0))
-print("Recall :", recall_score(Y_test, Y_pred, zero_division=0))
-print("F1 Score :", f1_score(Y_test, Y_pred, zero_division=0))
-print("ROC-AUC :", roc_auc_score(Y_test, test_error))
-
-print("\nClassification Report")
-print(classification_report(Y_test, Y_pred, digits=4, zero_division=0))
-
-# =========================================================
-# 16. Confusion Matrix
-# =========================================================
-cm = confusion_matrix(Y_test, Y_pred)
-
-plt.figure(figsize=(6, 5))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
-plt.xlabel('Predicted')
-plt.ylabel('Actual')
-plt.title('Mamba-AE Confusion Matrix')
-plt.show()
-
-# =========================================================
-# 17. FP / FN
+# 20. FP / FN
 # =========================================================
 false_positive_idx = np.where((Y_test == 0) & (Y_pred == 1))[0]
 false_negative_idx = np.where((Y_test == 1) & (Y_pred == 0))[0]
-
 print("False Positive :", len(false_positive_idx))
 print("False Negative :", len(false_negative_idx))
 print("FP Index :", false_positive_idx)
 print("FN Index :", false_negative_idx)
 
 # =========================================================
-# 18. Anomaly Score
+# 21. Threshold Training Loss
 # =========================================================
-plt.figure(figsize=(14, 5))
-plt.plot(test_error, label='Reconstruction Error')
-plt.axhline(threshold, linestyle='--', label='Threshold')
-
-if len(false_positive_idx) > 0:
-    plt.scatter(false_positive_idx, test_error[false_positive_idx], label='False Positive')
-
-if len(false_negative_idx) > 0:
-    plt.scatter(false_negative_idx, test_error[false_negative_idx], label='False Negative')
-
-plt.xlabel('Sequence Index')
-plt.ylabel('Reconstruction Error')
-plt.title('Mamba-AE Anomaly Score')
+plt.figure(figsize=(10, 5))
+plt.plot(threshold_history.history['loss'], label='Threshold Total Loss')
+plt.plot(threshold_history.history['classification_loss'], label='Classification Loss')
+plt.plot(threshold_history.history['smooth_loss'], label='Smooth Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Mamba Adaptive Threshold Loss')
 plt.legend()
 plt.grid()
 plt.show()
-
-# =========================================================
-# 19. 결과 표
-# =========================================================
-result_table = pd.DataFrame({
-    'Metric': ['Accuracy', 'Precision', 'Recall', 'F1 Score', 'ROC-AUC', 'False Positive', 'False Negative'],
-    'Mamba-AE': [
-        accuracy_score(Y_test, Y_pred),
-        precision_score(Y_test, Y_pred, zero_division=0),
-        recall_score(Y_test, Y_pred, zero_division=0),
-        f1_score(Y_test, Y_pred, zero_division=0),
-        roc_auc_score(Y_test, test_error), len(false_positive_idx), len(false_negative_idx)]})
-
-print(result_table.to_string(index=False))
